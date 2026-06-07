@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fina-question-lib"
+version = "0.1.0"
+description = "Deterministic question-understanding library for financial QA (JEE side-word method)"
+authors = [{name = "FinBench"}]
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "rich"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+question_lib = ["py.typed"]

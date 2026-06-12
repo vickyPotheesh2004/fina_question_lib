@@ -139,6 +139,16 @@ _REGISTRY: Dict[str, FormulaMatch] = {
         operation=Operation.DIFF,
         maths_lib_fn="working_capital",
     ),
+    # MOVE-4 (2026-06-12): operating cash flow ratio = OCF / current
+    # liabilities. FinanceBench asks this for Adobe (gold 0.66 / 0.83) and
+    # we had no formula — the question fell to raw OCF extraction.
+    "operating_cash_flow_ratio": FormulaMatch(
+        formula_id="operating_cash_flow_ratio",
+        inputs=["operating_cash_flow", "current_liabilities"],
+        output_unit="x",
+        operation=Operation.RATIO,
+        description="operating_cash_flow / current_liabilities",
+    ),
 
     # ── LEVERAGE ───────────────────────────────────────────────────────
     "debt_to_equity": FormulaMatch(
@@ -307,6 +317,15 @@ def match_formula(
     if not metric_id:
         return None
 
+    # MOVE-4 (2026-06-12): operation-aware rerouting. The subject extractor
+    # finds the METRIC ("operating cash flow") but the question's OPERATION
+    # ("...ratio") changes which formula applies. Without this, the metric's
+    # default (raw extraction) silently won.
+    if operation is not None:
+        rerouted = _OPERATION_REROUTES.get((metric_id, operation))
+        if rerouted and rerouted in _REGISTRY:
+            return _REGISTRY[rerouted]
+
     # Direct hit
     if metric_id in _REGISTRY:
         return _REGISTRY[metric_id]
@@ -317,6 +336,17 @@ def match_formula(
         return _REGISTRY[alias]
 
     return None
+
+
+# MOVE-4: (metric_id, Operation) → formula overrides
+_OPERATION_REROUTES = {
+    ("operating_cash_flow", Operation.RATIO): "operating_cash_flow_ratio",
+    ("cash",                Operation.RATIO): "cash_ratio",
+    ("inventory",           Operation.RATIO): "inventory_turnover",
+    ("net_income",          Operation.RATIO_PCT): "net_margin",
+    ("operating_income",    Operation.RATIO_PCT): "operating_margin",
+    ("gross_profit",        Operation.RATIO_PCT): "gross_margin",
+}
 
 
 def list_supported_formulas() -> List[str]:

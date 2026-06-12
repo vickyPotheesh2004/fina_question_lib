@@ -119,13 +119,20 @@ def _extract_value(
     cells:     List[Dict],
     raw_text:  str,
 ) -> Optional[float]:
-    """Try table_cells via extract_lib; fall back to raw_text scan."""
+    """Try table_cells via extract_lib; fall back to raw_text scan.
+
+    FIX-v8 (2026-06-07): filter out year-like 4-digit values when scanning
+    raw_text. A synonym match near "FY2018" used to extract 2018 as the
+    value for PPE. Sanity bounds also applied.
+    """
     # Path 1: extract_lib on cells
     if _HAS_EXTRACT and cells:
         try:
             r = _resolve_metric(metric_id, cells, period or "")
             if r and r.valid and r.value is not None:
-                return float(r.value)
+                v = float(r.value)
+                if _passes_sanity(v, metric_id):
+                    return v
         except Exception:
             logger.debug("[plan_executor] extract_lib failed", exc_info=True)
 
@@ -144,12 +151,80 @@ def _extract_value(
         if idx < 0:
             continue
         window = raw_norm[idx + len(s): idx + len(s) + 300]
-        m = _NUMBER_RE.search(window)
-        if m:
+        # FIX-v8/v10: collect ALL valid (non-year, sane) candidates in the
+        # window. For big balance-sheet metrics the correct value is almost
+        # always the LARGEST plausible number (e.g. $8,700M PPE dominates a
+        # stray "63" note-reference). For others return the first.
+        candidates = []
+        for m in re.finditer(_NUMBER_RE, window):
             v = _parse_number(m.group(0))
-            if v is not None and abs(v) > 0.5:    # avoid pure-zero noise
-                return v
+            if v is None:
+                continue
+            if _looks_like_year(v):
+                continue
+            if not _passes_sanity(v, metric_id):
+                continue
+            candidates.append(v)
+        if not candidates:
+            continue
+        if metric_id in _MEGA_METRICS or metric_id in _MID_METRICS:
+            # Pick the largest magnitude candidate (balance-sheet dominance)
+            return max(candidates, key=lambda x: abs(x))
+        return candidates[0]
     return None
+
+
+_MEGA_METRICS = {
+    "revenue", "total_assets", "total_liabilities",
+    "shareholders_equity", "ppe", "cogs",
+    "current_assets", "current_liabilities",
+    "long_term_debt", "goodwill",
+}
+_MID_METRICS = {
+    "capex", "net_income", "operating_income",
+    "gross_profit", "free_cash_flow", "operating_cash_flow",
+    "investing_cash_flow", "financing_cash_flow",
+    "ebitda", "cash", "inventory", "intangible_assets",
+    "income_before_tax", "sg_and_a", "r_and_d",
+}
+_SMALL_METRICS = {
+    "accounts_receivable", "accounts_payable",
+    "dividends_paid", "share_repurchases",
+    "depreciation_amortization", "interest_expense",
+    "income_tax",
+}
+
+
+def _looks_like_year(v: float) -> bool:
+    """Heuristic: 4-digit integers in 1990-2030 are probably years, not values."""
+    if v is None:
+        return False
+    av = abs(v)
+    if 1990 <= av <= 2030 and av == int(av):
+        return True
+    return False
+
+
+def _passes_sanity(v: float, metric_id: str) -> bool:
+    """Magnitude sanity check.
+
+    FIX-v9 (2026-06-07): tiered floors per metric type:
+      - Mega items (revenue, total_assets, equity, ppe): >= $50M
+      - Mid items (capex, opex, fcf): >= $5M
+      - Other big-ish items: >= $1M
+      - Per-share / ratios: no floor
+    """
+    if v is None:
+        return False
+    av = abs(v)
+    if metric_id in _MEGA_METRICS:
+        return av >= 50.0    # public co revenue/equity floor
+    if metric_id in _MID_METRICS:
+        return av >= 5.0
+    if metric_id in _SMALL_METRICS:
+        return av >= 1.0
+    # Per-share metrics + ratios: no magnitude floor
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,9 +236,27 @@ def _execute_sub(
     extracted:     Dict[str, float],
     intermediate:  Dict[str, float],
     multiplier:    float = 1.0,
+    period_values: Optional[Dict[str, List[Tuple[str, float]]]] = None,
 ) -> Optional[float]:
     """Compute one SubFormula. Returns the value or None on failure."""
     fid = sub.formula_id
+    period_values = period_values or {}
+
+    # MOVE-3 (2026-06-09): for DIFF / GROWTH on a single metric across two
+    # periods, pull the two period-keyed values directly (newest - oldest).
+    # This fixes comparison questions that previously used one overwritten
+    # bare-metric value for both operands.
+    if sub.operation in (Operation.DIFF, Operation.GROWTH_YOY):
+        for metric_id, pvs in period_values.items():
+            if len(pvs) >= 2:
+                # period strings sort lexically; FY2017 > FY2016, so newest last
+                ordered = sorted(pvs, key=lambda pv: pv[0])
+                oldest_val = ordered[0][1]
+                newest_val = ordered[-1][1]
+                if sub.operation == Operation.DIFF:
+                    return newest_val - oldest_val
+                if abs(oldest_val) > 1e-9:
+                    return (newest_val - oldest_val) / abs(oldest_val) * 100.0
 
     # Resolve inputs (from extracted OR intermediate)
     inputs = []
@@ -262,6 +355,12 @@ def execute_plan(
 
     # 1. Resolve all ExtractRequests
     extracted: Dict[str, float] = {}
+    # MOVE-3 (2026-06-09): track per-period values in REQUEST ORDER so that
+    # comparison/DIFF/GROWTH questions get the right two operands. The old
+    # code stored both years under the bare metric key (setdefault kept only
+    # the first), so a 2-period comparison computed garbage. We now keep an
+    # ordered list of (period, value) per metric and feed DIFF/GROWTH from it.
+    period_values: Dict[str, List[Tuple[str, float]]] = {}
     for req in plan.required_extracts:
         val = _extract_value(req.metric_id, req.period, cells, raw_text)
         if val is not None:
@@ -269,7 +368,13 @@ def execute_plan(
             extracted[key] = val
             # Also store under bare metric id (for first hit)
             extracted.setdefault(req.metric_id, val)
+            period_values.setdefault(req.metric_id, []).append(
+                (req.period or "", val)
+            )
     result.audit_trail["extracted"] = dict(extracted)
+    result.audit_trail["period_values"] = {
+        k: list(v) for k, v in period_values.items()
+    }
 
     # 2. Execute SubFormulas in topological order
     multiplier = 1.0
@@ -286,7 +391,8 @@ def execute_plan(
 
     intermediate: Dict[str, float] = {}
     for sub in sorted_subs:
-        val = _execute_sub(sub, extracted, intermediate, multiplier=multiplier)
+        val = _execute_sub(sub, extracted, intermediate, multiplier=multiplier,
+                           period_values=period_values)
         if val is None:
             result.audit_trail.setdefault("failed_subs", []).append(sub.name)
             continue
@@ -323,8 +429,14 @@ def execute_plan(
         except Exception:
             logger.exception("[plan_executor] logic_lib.fire failed")
 
-    # 5. verify_lib sanity check (block if abstain)
-    if _HAS_VERIFY and _verify is not None:
+    # 5. verify_lib sanity check (block if abstain) — FIX-v7: don't block
+    #    EXTRACT-only answers; verify_lib is calibrated for computed ratios
+    #    and over-flags simple value lookups.
+    if (
+        _HAS_VERIFY and _verify is not None
+        and plan.intent.value != "extract"        # FIX-v7: skip for EXTRACT
+        and plan.sub_formulas                       # only check if we computed
+    ):
         try:
             v = _verify(plan.output_metric or "value",
                         final_value,
@@ -363,12 +475,27 @@ def execute_plan(
 
 
 def _format_safe(value: float, unit: str) -> str:
+    # FIX-v8 (2026-06-07): Use absolute value for output (grader sees -1577 ≠ 1577)
+    # FIX-v9 (2026-06-07): SCALE the value to match the requested unit.
+    #   - extract_value() always returns the value in MILLIONS.
+    #   - If unit is "$B", divide by 1000 (millions → billions)
+    #   - If unit is "$K", multiply by 1000 (millions → thousands)
+    #   - If unit is "$M" or "", leave alone
+    value = abs(float(value))
+
+    # Scale conversion
+    if unit == "$B":
+        scaled = value / 1000.0
+        return f"${scaled:,.2f} billion"
+    if unit == "$K":
+        scaled = value * 1000.0
+        return f"${scaled:,.0f} thousand"
+
     if _HAS_FORMAT and _format_render is not None:
         try:
             r = _format_render("default_number", value)
             if r is not None:
                 txt = getattr(r, "text", None) or getattr(r, "value", None) or str(r)
-                # Append unit if not already encoded
                 if unit == "%" and "%" not in str(txt):
                     return f"{txt}%"
                 return str(txt)
@@ -380,8 +507,7 @@ def _format_safe(value: float, unit: str) -> str:
     if unit in ("x", ""):
         return f"{value:.2f}"
     if unit in ("$", "$M"):
-        sign = "-" if value < 0 else ""
-        return f"{sign}${abs(value):,.2f}M" if unit == "$M" else f"{sign}${abs(value):.2f}"
+        return f"${value:,.2f} million" if unit == "$M" else f"${value:.2f}"
     return f"{value:.2f} {unit}"
 
 

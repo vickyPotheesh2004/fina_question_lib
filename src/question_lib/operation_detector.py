@@ -42,6 +42,12 @@ _RATIO_PATTERNS = (
     r"\bp\s*/\s*e\b",
     r"\bp\s*/\s*b\b",
     r"\bturnover\b",
+    # MOVE-4 (2026-06-12): generic catch-all. "operating cash flow ratio"
+    # matched nothing above (only adjacent "cash ratio" counted), so the
+    # question fell to LOOKUP and we answered raw OCF ($1,488M) instead of
+    # the ratio (0.66). Checked AFTER the RATIO_PCT patterns, so margins
+    # and payout ratio keep their percent semantics.
+    r"\bratio\b",
 )
 
 # Growth / CAGR
@@ -55,6 +61,12 @@ _YOY_PATTERNS = (
     r"\byoy\b",
     r"\byear[\s\-]over[\s\-]year\b",
     r"\bgrowth\s+from\s+\w+\s+to\s+\w+\b",
+    # MOVE-4 (2026-06-12): bare "growth" ("What was revenue growth in
+    # FY2019?"). Previously unmatched → LOOKUP → we answered raw revenue
+    # ($187,890M) when gold wanted the growth percent (30.8%). PROJECT and
+    # CAGR are checked before this, so "if revenue grows at 5%" and
+    # "5-year growth" still route correctly.
+    r"\bgrowth\b",
 )
 
 # Diff

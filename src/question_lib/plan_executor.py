@@ -145,16 +145,17 @@ def _extract_value(
         return None
 
     raw_norm = _norm(raw_text)
-    for synonym in sorted(positives, key=len, reverse=True):
-        s = _norm(synonym)
-        idx = raw_norm.find(s)
-        if idx < 0:
-            continue
-        window = raw_norm[idx + len(s): idx + len(s) + 300]
-        # FIX-v8/v10: collect ALL valid (non-year, sane) candidates in the
-        # window. For big balance-sheet metrics the correct value is almost
-        # always the LARGEST plausible number (e.g. $8,700M PPE dominates a
-        # stray "63" note-reference). For others return the first.
+
+    # MOVE-6 (2026-06-13): the raw-text fallback used to IGNORE `period`, so
+    # revenue@2017 and revenue@2016 both scanned from the FIRST synonym
+    # occurrence and returned the SAME number — every YoY growth computed a
+    # fake 0.00%. Pass 1 now requires the requested 4-digit year to appear
+    # in the context around each synonym occurrence; Pass 2 keeps the old
+    # period-blind first-occurrence behaviour so existing wins don't regress.
+    _ym = re.search(r"(19|20)\d{2}", period or "")
+    year_tok = _ym.group(0) if _ym else ""
+
+    def _pick_from_window(window: str) -> Optional[float]:
         candidates = []
         for m in re.finditer(_NUMBER_RE, window):
             v = _parse_number(m.group(0))
@@ -166,11 +167,43 @@ def _extract_value(
                 continue
             candidates.append(v)
         if not candidates:
-            continue
-        if metric_id in _MEGA_METRICS or metric_id in _MID_METRICS:
-            # Pick the largest magnitude candidate (balance-sheet dominance)
+            return None
+        if metric_id in _MEGA_METRICS:
+            # Balance-sheet dominance: largest plausible value wins
+            # (e.g. $8,700M PPE beats a stray "63" note-reference).
             return max(candidates, key=lambda x: abs(x))
+        # MID/flow metrics: proximity wins (first sane number).
         return candidates[0]
+
+    sorted_syns = sorted(positives, key=len, reverse=True)
+
+    # ── Pass 1: year-anchored (only when a year was requested) ──────────
+    if year_tok:
+        for synonym in sorted_syns:
+            s = _norm(synonym)
+            seen = 0
+            for occ in re.finditer(re.escape(s), raw_norm):
+                seen += 1
+                if seen > 50:
+                    break
+                ctx_start = max(0, occ.start() - 120)
+                win_end   = occ.end() + 300
+                context   = raw_norm[ctx_start:win_end]
+                if year_tok not in context:
+                    continue
+                v = _pick_from_window(raw_norm[occ.end(): win_end])
+                if v is not None:
+                    return v
+
+    # ── Pass 2: original period-blind first-occurrence behaviour ────────
+    for synonym in sorted_syns:
+        s = _norm(synonym)
+        idx = raw_norm.find(s)
+        if idx < 0:
+            continue
+        v = _pick_from_window(raw_norm[idx + len(s): idx + len(s) + 300])
+        if v is not None:
+            return v
     return None
 
 
@@ -253,6 +286,12 @@ def _execute_sub(
                 ordered = sorted(pvs, key=lambda pv: pv[0])
                 oldest_val = ordered[0][1]
                 newest_val = ordered[-1][1]
+                # MOVE-6 (2026-06-13): if both periods extracted the SAME
+                # number, the period-aware scan failed to distinguish the
+                # years. Returning 0.00% would be a FAKE answer; return None
+                # so the question becomes an honest MISS instead.
+                if abs(newest_val - oldest_val) < 1e-9:
+                    return None
                 if sub.operation == Operation.DIFF:
                     return newest_val - oldest_val
                 if abs(oldest_val) > 1e-9:
@@ -301,6 +340,10 @@ def _execute_sub(
                 r *= x
             return r
         if op == Operation.GROWTH_YOY and len(inputs) >= 2:
+            # MOVE-6: identical operands → the two periods collapsed to one
+            # value; emit an honest MISS rather than a fake 0.00%.
+            if abs(inputs[0] - inputs[1]) < 1e-9:
+                return None
             return (inputs[0] - inputs[1]) / abs(inputs[1]) * 100.0
         if op == Operation.CAGR and len(inputs) >= 2:
             n = max(1, (sub.notes.count("year") or 1))

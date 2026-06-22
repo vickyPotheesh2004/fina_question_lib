@@ -20,6 +20,15 @@ from .models import (
     Operation, Period, Polarity, QuestionPlan, Subject, SubFormula,
 )
 
+try:
+    from . import advanced_formulas as _adv
+    from . import table_normalizer as _tnorm
+    _HAS_ADV = True
+except Exception:
+    _adv = None
+    _tnorm = None
+    _HAS_ADV = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,6 +43,7 @@ def answer_question(
     company:  str = "",
     fiscal_year: str = "",
     doc_type: str = "",
+    structured_tables: Optional[List[Dict]] = None,
 ) -> ExecutionResult:
     """
     One-shot entry point: parse + execute in a single call.
@@ -41,8 +51,38 @@ def answer_question(
     Returns ExecutionResult.answered = True if we got a final answer.
     Returns ExecutionResult.answered = False (and reasons in audit_trail)
     when the question couldn't be answered deterministically.
+
+    `structured_tables` (2026-06-20): preserved table shapes (headers + rows)
+    enable exact (metric, year) column lookup — fixes period-collapse bugs.
     """
     plan = parse_question(question)
+
+    # ADVANCED multi-year formula solver (2026-06-21): handles ROA/ROE with
+    # averaging, DPO/DSO/DIO, fixed-asset-turnover, 3yr-avg capex%, and
+    # YoY-change questions that the single-year DAG executor cannot. Uses the
+    # normalized (metric, year) map. Runs FIRST; falls through if not matched.
+    if _HAS_ADV and structured_tables:
+        try:
+            adv_id = _adv.detect_advanced(question)
+            if adv_id:
+                norm = _tnorm.build_normalized(
+                    structured_tables, doc_fiscal_year=fiscal_year
+                )
+                solved = _adv.solve(question, norm, fiscal_year, raw_text=raw_text)
+                if solved is not None:
+                    value, unit = solved
+                    res = ExecutionResult(answered=True)
+                    res.final_value = value
+                    res.final_unit = unit
+                    res.confidence = 0.9
+                    ans = _adv.format_answer(value, unit)
+                    citation = f"{company}/{doc_type}/{fiscal_year}/{adv_id}"
+                    res.final_answer = f"{ans} [{citation}]"
+                    res.audit_trail["advanced_formula"] = adv_id
+                    return res
+        except Exception:
+            logger.debug("[answer_question] advanced solver failed", exc_info=True)
+
     return execute_plan(
         plan=plan,
         cells=cells or [],
@@ -50,6 +90,7 @@ def answer_question(
         company=company,
         fy=fiscal_year,
         doc_type=doc_type,
+        structured_tables=structured_tables or [],
     )
 
 

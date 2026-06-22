@@ -32,6 +32,52 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# Narrative-question guard (2026-06-21): the 150-run showed the executor
+# answering QUALITATIVE questions with a stray number (Amcor 'Adjusted Non
+# GAAP EBITDA' -> $2,117M when gold is the sentence '$2,018mn'; 'Real change
+# in Sales' -> $14,694M when gold is 'flat'). These have a TEXT gold answer;
+# a number scores 0 AND blocks the LLM. We ABSTAIN (answered=False) so the
+# question falls through to the LLM. Conservative: a concrete numeric metric
+# overrides the narrative cue, so real numeric questions still compute.
+_NARRATIVE_CUES = (
+    "what industry", "what is the nature", "what are the major",
+    "major acquisitions", "what acquisitions", "diversification",
+    "diversified", "product categories", "primary customers",
+    "key customers", "legal proceedings", "lawsuit", "litigation",
+    "key agenda", "agenda of", "what is the purpose",
+    "nature & purpose", "nature and purpose", "primarily operate",
+    "competitive", "who is", "is the ceo", "new ceo", "spin off",
+    "spin-off", "spinning off", "real change in sales", "real growth",
+    "real change", "organic change", "organic growth",
+    "adjusted non gaap", "adjusted non-gaap", "non gaap ebitda",
+    "non-gaap ebitda", "adj. ebitda", "adjusted ebitda",
+)
+_NUMERIC_OVERRIDE = (
+    "days payable", "days sales", "dpo", "dso", "dio", "turnover",
+    "quick ratio", "current ratio", "operating cash flow ratio",
+    "fixed asset turnover", "return on", "capital expenditure",
+    "yoy", "year-over-year", "year over year", "net income",
+)
+
+
+def _is_narrative_question(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if not any(cue in q for cue in _NARRATIVE_CUES):
+        return False
+    # 'real change in sales' / 'real growth' / EBITDA-narrative are always
+    # narrative traps even though they mention sales/ebitda.
+    if ("real change" in q or "real growth" in q
+            or "non gaap ebitda" in q or "non-gaap ebitda" in q
+            or "adjusted non gaap" in q or "adjusted non-gaap" in q
+            or "adj. ebitda" in q or "adjusted ebitda" in q):
+        return True
+    if any(w in q for w in _NUMERIC_OVERRIDE):
+        return False
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # One-shot helper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,6 +101,14 @@ def answer_question(
     `structured_tables` (2026-06-20): preserved table shapes (headers + rows)
     enable exact (metric, year) column lookup — fixes period-collapse bugs.
     """
+    # NARRATIVE GUARD: abstain on qualitative questions whose gold is a
+    # sentence/list, so they fall through to the LLM instead of returning a
+    # confident-wrong number. (Amcor EBITDA / 'real change in sales' traps.)
+    if _is_narrative_question(question):
+        res = ExecutionResult(answered=False)
+        res.audit_trail["reason"] = "narrative_question_abstain"
+        return res
+
     plan = parse_question(question)
 
     # ADVANCED multi-year formula solver (2026-06-21): handles ROA/ROE with

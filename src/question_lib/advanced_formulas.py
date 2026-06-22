@@ -69,6 +69,11 @@ _RAW_SYNS = {
                    "change in", "decrease in", "increase in",
                    "raw materials", "work in process", "finished goods",
                    "held for sale"]),
+    "current_assets": (["total current assets"],
+                       ["non-current", "noncurrent"]),
+    "current_liabilities": (["total current liabilities"],
+                           ["non-current", "noncurrent", "long-term",
+                            "held for sale"]),
 }
 
 # Metrics for which the normalized-map value is UNRELIABLE (the table
@@ -79,6 +84,10 @@ _RAW_SYNS = {
 #   Amazon inventory: map had sub-line 3,583; real total inventory 16,047.
 #   Activision PP&E: _raw_lookup returned 253 for BOTH years; the real
 #     balance-sheet line has 253 (2019) and 282 (2018) - needs year-mapping.
+# NOTE: current_assets / current_liabilities were tried here but the
+# magnitude-based balance-sheet line pick regressed Amcor quick ratio
+# (re-activated a wrong 0.89 that was correctly abstaining). Reverted to the
+# three metrics where the year-header raw fallback is proven safe.
 _PREFER_RAW_MAX = {"accounts_payable", "inventory", "ppe"}
 
 
@@ -385,16 +394,15 @@ def solve(question: str, norm: Dict, fiscal_year: str,
                 return (abs(cx) / rv * 100.0, "%")
 
         if fid == "quick_ratio_2yr":
-            ca = _get(norm, "current_assets", t)
-            inv = _get(norm, "inventory", t)
-            cl = _get(norm, "current_liabilities", t)
+            ca = _operand(norm, raw_text, "current_assets", t, anchor_year=t)
+            inv = _operand(norm, raw_text, "inventory", t, anchor_year=t)
+            cl = _operand(norm, raw_text, "current_liabilities", t, anchor_year=t)
             if ca is not None and inv is not None and cl:
                 qr = (ca - inv) / cl
-                # sanity: a real quick ratio sits roughly in [0.1, 5]. A value
+                # sanity: a real quick ratio sits roughly in [0.05, 8]. A value
                 # far outside that means an operand (often inventory or CL)
-                # was mis-extracted -> abstain rather than emit garbage (the
-                # Amcor 0.03 case came from a bad inventory/CL operand).
-                if 0.1 <= qr <= 5.0:
+                # was mis-extracted -> abstain rather than emit garbage.
+                if 0.05 <= qr <= 8.0:
                     return (qr, "x")
                 return None
 
